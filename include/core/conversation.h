@@ -1,3 +1,4 @@
+#pragma once
 #include "core/message.h"
 #include <cstddef>
 

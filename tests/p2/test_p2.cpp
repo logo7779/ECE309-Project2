@@ -8,7 +8,6 @@
 // body of main() with your own tests.
 
 #include "core/conversation.h"
-#include "core/message.h"
 #include "core/sentinel_scanner.h"
 #include "harness/harness.h"
 #include "model/replay_client.h"
@@ -16,11 +15,77 @@
 
 #include <cassert>
 
+#include <fstream>
 #include <cassert>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <utility>
+
+// ============================================================
+// Test helper classes
+// ============================================================
+
+class TestInput : public InputSource {
+public:
+    explicit TestInput(std::vector<std::string> lines)
+        : lines_(std::move(lines)) {}
+
+    std::string read_line() override {
+        if (index_ >= lines_.size()) {
+            eof_ = true;
+            return "";
+        }
+
+        return lines_[index_++];
+    }
+
+    bool is_eof() const override {
+        return eof_;
+    }
+
+private:
+    std::vector<std::string> lines_;
+    std::size_t index_ = 0;
+    bool eof_ = false;
+};
+
+
+class EOFInput : public InputSource {
+public:
+    std::string read_line() override {
+        return "";
+    }
+
+    bool is_eof() const override {
+        return true;
+    }
+};
+
+
+class TestOutput : public OutputSink {
+public:
+    void write(std::string_view text) override {
+        output += text;
+    }
+
+    std::string output;
+};
+
+
+class TestModel : public ModelClient {
+public:
+    explicit TestModel(std::string response)
+        : response_(std::move(response)) {}
+
+    void generate(const Conversation&, TokenSink& sink) override {
+        sink.on_chunk(response_);
+        sink.on_complete();
+    }
+
+private:
+    std::string response_;
+};
 
 
 // ============================================================
@@ -535,14 +600,252 @@ void test_scanner_bounded_stream()
     std::cout << "PASS: scanner bounded 4 MB stream\n";
 }
 
+// ============================================================
+// Harness Tests
+// ============================================================
+
+void test_harness_turn_limit() {
+    auto model = std::make_unique<TestModel>("hello");
+
+    HarnessConfig cfg;
+    cfg.max_turns = 2;
+
+    Harness harness(std::move(model), cfg);
+
+    TestInput input({
+        "first",
+        "second",
+        "third"
+    });
+
+    TestOutput output;
+
+    StopReason reason = harness.run(input, output);
+
+    assert(reason.kind == StopReason::Kind::TurnLimit);
+
+    // Exactly two turns should occur.
+    assert(harness.conversation().size() == 4);
+
+    assert(harness.conversation().at(0).role() == Role::User);
+    assert(harness.conversation().at(0).content() == "first");
+
+    assert(harness.conversation().at(1).role() == Role::Assistant);
+    assert(harness.conversation().at(1).content() == "hello");
+
+    assert(harness.conversation().at(2).role() == Role::User);
+    assert(harness.conversation().at(2).content() == "second");
+
+    assert(harness.conversation().at(3).role() == Role::Assistant);
+    assert(harness.conversation().at(3).content() == "hello");
+}
+
+
+void test_harness_sentinel_halt() {
+    const std::string sentinel = "<|end_conversation|>";
+
+    auto model = std::make_unique<TestModel>(
+        "Hello there!" +
+        sentinel +
+        "THIS SHOULD BE DISCARDED"
+    );
+
+    HarnessConfig cfg;
+    cfg.max_turns = 20;
+
+    Harness harness(std::move(model), cfg);
+
+    TestInput input({
+        "hello"
+    });
+
+    TestOutput output;
+
+    StopReason reason = harness.run(input, output);
+
+    assert(reason.kind == StopReason::Kind::Sentinel);
+
+    // Only one turn should occur.
+    assert(harness.conversation().size() == 2);
+
+    assert(harness.conversation().at(0).role() == Role::User);
+    assert(harness.conversation().at(0).content() == "hello");
+
+    assert(harness.conversation().at(1).role() == Role::Assistant);
+
+    // The sentinel must be stored in the conversation.
+    assert(
+        harness.conversation().at(1).content()
+        == "Hello there!" + sentinel
+    );
+
+    // The sentinel must NOT be printed.
+    assert(output.output.find(sentinel) == std::string::npos);
+
+    // Text after the sentinel must be discarded.
+    assert(
+        output.output.find("THIS SHOULD BE DISCARDED")
+        == std::string::npos
+    );
+
+    // Normal assistant text must be printed.
+    assert(
+        output.output.find("Hello there!")
+        != std::string::npos
+    );
+}
+
+
+void test_harness_system_message() {
+    auto model = std::make_unique<TestModel>("response");
+
+    HarnessConfig cfg;
+    cfg.max_turns = 1;
+    cfg.system_message = "Be concise.";
+
+    Harness harness(std::move(model), cfg);
+
+    TestInput input({
+        "hello"
+    });
+
+    TestOutput output;
+
+    StopReason reason = harness.run(input, output);
+
+    assert(reason.kind == StopReason::Kind::TurnLimit);
+
+    assert(harness.conversation().size() == 3);
+
+    assert(harness.conversation().at(0).role() == Role::System);
+    assert(harness.conversation().at(0).content() == "Be concise.");
+
+    assert(harness.conversation().at(1).role() == Role::User);
+    assert(harness.conversation().at(1).content() == "hello");
+
+    assert(harness.conversation().at(2).role() == Role::Assistant);
+    assert(harness.conversation().at(2).content() == "response");
+}
+
+
+void test_harness_user_exit() {
+    auto model = std::make_unique<TestModel>("should not happen");
+
+    HarnessConfig cfg;
+    cfg.max_turns = 5;
+
+    Harness harness(std::move(model), cfg);
+
+    EOFInput input;
+    TestOutput output;
+
+    StopReason reason = harness.run(input, output);
+
+    assert(reason.kind == StopReason::Kind::UserExit);
+
+    // No conversation messages should have been created.
+    assert(harness.conversation().size() == 0);
+
+    // Model should never have generated anything.
+    assert(
+        output.output.find("should not happen")
+        == std::string::npos
+    );
+}
+
+void test_replay_transcript_round_trip() {
+    const std::string transcript_path = "test_round_trip.transcript";
+
+    {
+        std::ofstream file(transcript_path);
+
+        assert(file.is_open());
+
+        file << "role: system\n";
+        file << "\n";
+        file << "Be concise.\n";
+        file << "\n";
+        file << "---\n";
+        file << "\n";
+        file << "role: user\n";
+        file << "\n";
+        file << "hello\n";
+        file << "\n";
+        file << "---\n";
+        file << "\n";
+        file << "role: assistant\n";
+        file << "\n";
+        file << "Hi there!\n";
+        file << "\n";
+        file << "---\n";
+        file << "\n";
+        file << "role: user\n";
+        file << "\n";
+        file << "How are you?\n";
+        file << "\n";
+        file << "---\n";
+        file << "\n";
+        file << "role: assistant\n";
+        file << "\n";
+        file << "I am here to help.\n";
+        file << "\n";
+        file << "---\n";
+    }
+
+    ReplayModelClient replay(transcript_path);
+
+    // The leading system block must be recovered.
+    assert(replay.system_message() == "Be concise.");
+
+    Conversation conv;
+
+    conv.append(Message(Role::System, "Be concise."));
+    conv.append(Message(Role::User, "hello"));
+
+    Message first_reply = replay.generate(conv);
+
+    assert(first_reply.role() == Role::Assistant);
+    assert(first_reply.content() == "Hi there!");
+
+    conv.append(first_reply);
+    conv.append(Message(Role::User, "How are you?"));
+
+    Message second_reply = replay.generate(conv);
+
+    assert(second_reply.role() == Role::Assistant);
+    assert(second_reply.content() == "I am here to help.");
+
+    conv.append(second_reply);
+
+    // The replayed conversation should contain the same
+    // system/user/assistant sequence represented by the transcript.
+    assert(conv.size() == 5);
+
+    assert(conv.at(0).role() == Role::System);
+    assert(conv.at(0).content() == "Be concise.");
+
+    assert(conv.at(1).role() == Role::User);
+    assert(conv.at(1).content() == "hello");
+
+    assert(conv.at(2).role() == Role::Assistant);
+    assert(conv.at(2).content() == "Hi there!");
+
+    assert(conv.at(3).role() == Role::User);
+    assert(conv.at(3).content() == "How are you?");
+
+    assert(conv.at(4).role() == Role::Assistant);
+    assert(conv.at(4).content() == "I am here to help.");
+
+    // Clean up the temporary transcript.
+    std::remove(transcript_path.c_str());
+}
 
 // ============================================================
 // Main
 // ============================================================
 
-int main()
-{
-    // Conversation
+int main() {
+    // Conversation tests
     test_empty_conversation();
     test_conversation_append_and_access();
     test_system_message_ordering();
@@ -554,7 +857,7 @@ int main()
     test_conversation_growth();
     test_conversation_iteration();
 
-    // SentinelScanner
+    // SentinelScanner tests
     test_scanner_clean_text();
     test_scanner_whole_sentinel();
     test_scanner_split_every_boundary();
@@ -564,9 +867,13 @@ int main()
     test_scanner_flush();
     test_scanner_bounded_stream();
 
-    std::cout << "\n========================================\n";
-    std::cout << "ALL TESTS PASSED\n";
-    std::cout << "========================================\n";
+    // Harness tests
+    test_harness_turn_limit();
+    test_harness_sentinel_halt();
+    test_harness_system_message();
+    test_harness_user_exit();
+    test_replay_transcript_round_trip();
 
+    std::cout << "All tests passed!\n";
     return 0;
 }
