@@ -1,6 +1,5 @@
 #include "core/message.h"
 #include <string>
-using namespace std;
 
 Message::Message()
     : role_(Role::System), content_(""){}

@@ -16,6 +16,7 @@ include_directories(include)
 
 # 1. Define the core files (everything EXCEPT main.cpp).
 set(CORE_SOURCES
+    src/message.cpp
     src/conversation.cpp
     src/sentinel_scanner.cpp
     src/model_client.cpp
