@@ -1,4 +1,4 @@
-# ECE 309 Project 2 — Mini-Harness
+# ECE 309 Project 2
 
 ## Overview
 
