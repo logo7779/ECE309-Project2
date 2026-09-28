@@ -1,5 +1,3 @@
-# Design Log — Project 2
-
 # ECE 309 Project 2 — Design Log
 
 ## Overview
